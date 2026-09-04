@@ -23,6 +23,14 @@ const (
 	MaxDatagramFrameSize = 1200
 	MaxUDPSize           = 4096
 
+	// AdvertisedMaxDatagramFrameSize is the max_datagram_frame_size the server
+	// advertises: the largest DATAGRAM frame it is willing to receive. It is kept
+	// separate from MaxDatagramFrameSize, which stays the size assumed for peers
+	// that omit the parameter (so what the server SENDS is unchanged). 1400 lets
+	// a 1250-byte QUIC packet plus the UDPMessage header fit in one frame; the
+	// receiver (quic-go) accepts frames up to wire.MaxDatagramSize (16383).
+	AdvertisedMaxDatagramFrameSize = 1400
+
 	maxVarInt1 = 63
 	maxVarInt2 = 16383
 	maxVarInt4 = 1073741823

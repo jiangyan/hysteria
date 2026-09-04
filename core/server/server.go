@@ -60,7 +60,7 @@ func NewServer(config *Config) (Server, error) {
 		MaxIncomingStreams:             config.QUICConfig.MaxIncomingStreams,
 		DisablePathMTUDiscovery:        config.QUICConfig.DisablePathMTUDiscovery,
 		EnableDatagrams:                true,
-		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
+		MaxDatagramFrameSize:           protocol.AdvertisedMaxDatagramFrameSize,
 		AssumePeerMaxDatagramFrameSize: protocol.MaxDatagramFrameSize,
 		DisablePathManager:             true,
 	}
