@@ -27,14 +27,26 @@ package server
 //   - STOP_SENDING with code 0 is not an abort. The official client closes
 //     every stream that way (QStream.Close: CancelRead(0) + Close) whenever
 //     its side ends, so code 0 means "I will read no more": the upload is
-//     still carried to its end and then the destination is closed as
-//     upstream closes it. daisy aborts with a nonzero code. (The independent
-//     review of A4: reading code 0 as an abort reset the destination under
-//     every official client, and cut uploads short: 122 524 of 262 151 bytes
-//     in relay_tcp_test.go.)
+//     still carried to its end. The destination may still be sending, so the
+//     download copy keeps consuming (and dropping) what it sends until its
+//     EOF, for up to readerGoneDrain once the upload is done: a socket closed
+//     with unread data is RESET by Linux, which would discard the upload's
+//     tail still queued behind it. Past that bound the caller's close may
+//     reset it, as upstream's always could. daisy aborts with a nonzero code.
+//     (The independent review of A4: reading code 0 as an abort reset the
+//     destination under every official client, and cut uploads short:
+//     122 524 of 262 151 bytes in relay_tcp_test.go. Codex round 3: the
+//     drain, and quic-go's untyped error from Close on a stopped stream.)
+//   - an abort reaches the destination as an RST wherever the outbound's TCP
+//     socket can be found: the connection itself, or the socket under a
+//     wrapper that exposes NetConn (*tls.Conn for the HTTPS outbound,
+//     cachedConn for HTTP CONNECT). Anything else closes as it closes.
 // A remote connection that cannot half-close (no CloseWrite) keeps upstream's
-// behaviour for a clean end: the first direction to end ends the relay, and
-// the other copy is not waited for.
+// behaviour for a clean end: the first direction to end ends the relay. The
+// other copy is not waited for; if it is still blocked on the client's flow
+// control fallbackWriteGrace later, its stream side is reset so the
+// goroutine ends (upstream's copyTwoWay leaked it for as long as the client
+// kept the connection without reading).
 //
 // Known gap, shared with upstream: once the remote → client copy has ended
 // cleanly, a client reset while the client → remote copy is parked in
@@ -57,6 +69,17 @@ import (
 // streamAbortCode is the application error code a relayed stream is reset
 // with when its transfer failed. Clients treat any reset as an abort.
 const streamAbortCode quic.StreamErrorCode = 0
+
+// readerGoneDrain bounds how long, once the upload is done, the relay keeps
+// consuming what a destination still sends to a client that reads no more
+// (a code-0 STOP_SENDING), so that the destination's socket is closed with
+// nothing unread. A variable so tests can shorten it.
+var readerGoneDrain = 5 * time.Second
+
+// fallbackWriteGrace bounds how long the no-CloseWrite fallback leaves a
+// copy blocked in stream.Write by the client's flow control before it resets
+// the stream's send side. A variable so tests can shorten it.
+var fallbackWriteGrace = 30 * time.Second
 
 type closeWriter interface {
 	CloseWrite() error
@@ -132,7 +155,14 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 			// The remote finished sending: FIN the stream's send side only.
 			// QStream.Close would also cancel the read side, cutting off
 			// whatever the client is still uploading.
-			err = stream.Stream.Close()
+			err = closeSendSide(stream)
+		}
+		if halfClose && clientStoppedReading(err) {
+			// The client reads no more, but the destination may still be
+			// sending: keep consuming it until its EOF, or until the read
+			// deadline the relay sets once the upload is done, so its socket
+			// is not closed with unread data (see readerGoneDrain).
+			_, _ = io.Copy(io.Discard, remote)
 		}
 		results <- relayEnd{toRemote: false, err: err}
 	}()
@@ -151,15 +181,25 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 		// STOP_SENDING, a CancelWrite or the connection's end — not by Close
 		// or CancelRead — so it is not waited for here (Codex round 1 on A4);
 		// upstream's copyTwoWay never waited for it either. `results` is
-		// buffered, so its late send does not block.
+		// buffered, so its late send does not block. If it is still blocked
+		// fallbackWriteGrace later, reset the stream's send side so the
+		// goroutine ends (Codex round 3 on A4).
 		_ = remote.Close()
 		stream.CancelRead(streamAbortCode)
+		time.AfterFunc(fallbackWriteGrace, func() {
+			select {
+			case <-results:
+			default:
+				stream.CancelWrite(streamAbortCode)
+			}
+		})
 		return nil
 	}
 
 	pending := 2                     // copies still running
 	upDone, downDone := false, false // each direction ended without a failure
 	readerGone := false              // the client closed its reading side (code 0)
+	draining := false                // the drain's deadline is set
 	// While a copy is still running it may be parked in remote.Read on a
 	// silent destination, where nothing tells it the client has since given
 	// up: a client reset after its FIN arrives as STOP_SENDING on the
@@ -185,9 +225,10 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 				upDone = true
 			case r.err == nil:
 				downDone = true
-			case !r.toRemote && clientStoppedReading(r.err):
-				// The client will read no more; its upload may still be
-				// arriving.
+			case !r.toRemote && (readerGone || clientStoppedReading(r.err)):
+				// The client reads no more (the download copy has drained
+				// what the destination sent, or its drain was cut); its
+				// upload may still be arriving.
 				downDone, readerGone = true, true
 			default:
 				return fail(r.err)
@@ -206,15 +247,54 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 				return fail(cause)
 			}
 		}
-		if readerGone && upDone && !downDone {
-			// The upload is complete and the client reads no more: nothing
-			// is left to relay. Close the destination as upstream does; that
-			// ends a remote → client copy parked in remote.Read.
-			_ = remote.Close()
-			<-results
-			pending--
-			downDone = true
+		if readerGone && upDone && !downDone && !draining {
+			// The upload is complete and the client reads no more. Give the
+			// destination up to readerGoneDrain to finish while the download
+			// copy consumes what it still sends; the copy's result ends the
+			// loop. A copy parked on a silent destination ends at the
+			// deadline.
+			_ = remote.SetReadDeadline(time.Now().Add(readerGoneDrain))
+			draining = true
 		}
+	}
+	return nil
+}
+
+// closeSendSide FINs the stream's send side. On a send side the peer has
+// already stopped, quic-go's Close returns an untyped error ("close called
+// for canceled stream"); the context's cause carries the peer's StreamError,
+// which is returned instead, so the relay tells a code-0 close from an abort
+// even when this result reaches it before the context's cancellation does
+// (Codex round 3 on A4).
+func closeSendSide(stream *utils.QStream) error {
+	err := stream.Stream.Close()
+	if err != nil {
+		if cause := context.Cause(stream.Context()); cause != nil && cause != context.Canceled {
+			return cause
+		}
+	}
+	return err
+}
+
+// lingerTarget finds the connection whose linger decides how remote closes:
+// remote itself, or the TCP socket under a wrapper that exposes NetConn
+// (*tls.Conn for the HTTPS outbound, cachedConn for HTTP CONNECT). Without
+// it, an abort through a wrapped outbound closed gracefully (Codex round 3
+// on A4).
+func lingerTarget(remote net.Conn) lingerSetter {
+	for c := remote; c != nil; {
+		if l, ok := c.(lingerSetter); ok {
+			return l
+		}
+		u, ok := c.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil
+		}
+		next := u.NetConn()
+		if next == c {
+			return nil
+		}
+		c = next
 	}
 	return nil
 }
@@ -222,7 +302,7 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 // abortTCP ends a failed transfer so that neither end reads it as complete:
 // the remote connection with an RST, the stream with a reset both ways.
 func abortTCP(stream *utils.QStream, remote net.Conn) {
-	if l, ok := remote.(lingerSetter); ok {
+	if l := lingerTarget(remote); l != nil {
 		_ = l.SetLinger(0)
 	}
 	_ = remote.Close()

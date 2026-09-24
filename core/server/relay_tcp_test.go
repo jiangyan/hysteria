@@ -117,9 +117,21 @@ func newRelayRig(t *testing.T, clientConf *quic.Config) *relayRig {
 	return &relayRig{client: cs, server: &utils.QStream{Stream: ss}, remote: remote, dest: dest.(*net.TCPConn)}
 }
 
+// start runs the relay and then closes both sides the way handleTCPRequest
+// does right after it returns (tConn.Close, stream.Close), so a test sees
+// what production's final close does (Codex round 3 on A4).
 func (r *relayRig) start() <-chan error {
+	return r.startWith(r.remote)
+}
+
+func (r *relayRig) startWith(remote net.Conn) <-chan error {
 	done := make(chan error, 1)
-	go func() { done <- relayTCPFast(r.server, r.remote) }()
+	go func() {
+		err := relayTCPFast(r.server, remote)
+		_ = remote.Close()
+		_ = r.server.Close()
+		done <- err
+	}()
 	return done
 }
 
@@ -257,10 +269,12 @@ type noHalfClose struct{ net.Conn }
 // be blocked in stream.Write by flow control, which neither remote.Close
 // nor CancelRead releases, so the relay must not wait for it.
 func TestRelayTCPFallbackReturnsWhileTheDownloadIsBlocked(t *testing.T) {
+	old := fallbackWriteGrace
+	fallbackWriteGrace = 300 * time.Millisecond
+	t.Cleanup(func() { fallbackWriteGrace = old })
 	// A client that never reads: its stream window stays small, and full.
 	r := newRelayRig(t, &quic.Config{InitialStreamReceiveWindow: 16 << 10, MaxStreamReceiveWindow: 16 << 10})
-	done := make(chan error, 1)
-	go func() { done <- relayTCPFast(r.server, noHalfClose{r.remote}) }()
+	done := r.startWith(noHalfClose{r.remote})
 	go func() { _, _ = r.dest.Write(make([]byte, 4<<20)) }()
 	// Let the download fill the window and block in stream.Write.
 	time.Sleep(300 * time.Millisecond)
@@ -269,8 +283,16 @@ func TestRelayTCPFallbackReturnsWhileTheDownloadIsBlocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitRelay(t, done, "the fallback is waiting on a download blocked by flow control")
-	// Release the blocked writer.
-	r.client.CancelRead(0)
+	// The blocked copy is not left for ever (Codex round 3 on A4): after the
+	// grace its stream side is reset, so a client that finally reads gets
+	// the reset, not an EOF that makes the cut download look complete.
+	time.Sleep(600 * time.Millisecond)
+	_ = r.client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, err := io.ReadAll(r.client)
+	var se *quic.StreamError
+	if !errors.As(err, &se) {
+		t.Fatalf("the blocked download must end in a reset after the grace, got %v", err)
+	}
 }
 
 // officialClientClose closes the client's end the way the official hysteria
@@ -300,6 +322,11 @@ func TestRelayTCPOfficialClientCloseIsAnOrdinaryClose(t *testing.T) {
 	if err != nil || len(got) != len("request")+len(upload) {
 		t.Fatalf("destination read %d bytes, %v; want %d, then EOF", len(got), err, len("request")+len(upload))
 	}
+	// The destination closes its side once the upload has ended, as servers
+	// do; until then the relay drains it (readerGoneDrain).
+	if err := r.dest.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
 	if err := waitRelay(t, done, "the relay must end on the client's close"); err != nil {
 		t.Fatalf("an ordinary close ended the relay with %v", err)
 	}
@@ -311,13 +338,13 @@ func TestRelayTCPOfficialClientCloseIsAnOrdinaryClose(t *testing.T) {
 func TestRelayTCPOfficialClientCloseDuringADownloadKeepsTheUpload(t *testing.T) {
 	r := newRelayRig(t, nil)
 	done := r.start()
-	stop := make(chan struct{})
-	defer close(stop)
+	stopped := make(chan struct{}, 1)
 	go func() {
 		chunk := make([]byte, 16<<10)
 		for {
 			select {
-			case <-stop:
+			case <-stopped:
+				_ = r.dest.CloseWrite()
 				return
 			default:
 			}
@@ -336,6 +363,9 @@ func TestRelayTCPOfficialClientCloseDuringADownloadKeepsTheUpload(t *testing.T) 
 	if err != nil || len(got) != len("request")+len(upload) {
 		t.Fatalf("destination read %d bytes, %v; want %d, then EOF", len(got), err, len("request")+len(upload))
 	}
+	// The upload is done: the destination stops sending and closes its side,
+	// which ends the relay's drain.
+	stopped <- struct{}{}
 	if err := waitRelay(t, done, "the relay must end on the client's close"); err != nil {
 		t.Fatalf("an ordinary close ended the relay with %v", err)
 	}
@@ -395,5 +425,188 @@ func TestRelayTCPDestinationFirstHalfCloseCarriesTheUpload(t *testing.T) {
 	}
 	if err := waitRelay(t, done, "the relay must end after both directions ended"); err != nil {
 		t.Fatalf("a clean relay returned %v", err)
+	}
+}
+
+// Codex round 3 on A4, P1: the client stops reading (code 0) while its
+// upload is still arriving, and the destination then half-closes. The
+// download copy's Close fails with quic-go's untyped "close called for
+// canceled stream"; read as a failure it aborted the destination and cut the
+// rest of the upload. The upload must still arrive whole.
+func TestRelayTCPStopThenDestinationEOFKeepsTheUpload(t *testing.T) {
+	r := newRelayRig(t, nil)
+	done := r.start()
+	r.client.CancelRead(0) // the official client's STOP_SENDING, before its FIN
+	time.Sleep(100 * time.Millisecond)
+	if err := r.dest.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, err := r.client.Write([]byte(" and the rest")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = r.dest.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(r.dest)
+	if err != nil || string(got) != "request and the rest" {
+		t.Fatalf("destination read %q, %v; want the whole upload, then EOF", got, err)
+	}
+	if err := waitRelay(t, done, "the relay must end"); err != nil {
+		t.Fatalf("an ordinary close ended the relay with %v", err)
+	}
+}
+
+// Codex round 3 on A4, P1: after the official client's close, a destination
+// that is still sending must not have its socket closed under it with unread
+// data (Linux resets such a close, discarding the upload's queued tail): the
+// relay drains it and ends only at its EOF.
+func TestRelayTCPOfficialClientCloseWaitsForTheDestinationsEOF(t *testing.T) {
+	r := newRelayRig(t, nil)
+	done := r.start()
+	stopSending := make(chan struct{})
+	go func() {
+		chunk := make([]byte, 4<<10)
+		for {
+			select {
+			case <-stopSending:
+				_ = r.dest.CloseWrite()
+				return
+			default:
+			}
+			if _, err := r.dest.Write(chunk); err != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	officialClientClose(t, r.client)
+	time.Sleep(400 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("the relay ended (%v) while the destination was still sending", err)
+	default:
+	}
+	close(stopSending)
+	if err := waitRelay(t, done, "the relay must end at the destination's EOF"); err != nil {
+		t.Fatalf("an ordinary close ended the relay with %v", err)
+	}
+	_ = r.dest.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(r.dest)
+	if err != nil || string(got) != "request" {
+		t.Fatalf("destination read %q, %v; want the upload, then EOF", got, err)
+	}
+}
+
+// The drain is bounded: a destination that never stops sending holds the
+// relay for readerGoneDrain after the upload, no longer.
+func TestRelayTCPOfficialClientCloseDrainIsBounded(t *testing.T) {
+	old := readerGoneDrain
+	readerGoneDrain = 300 * time.Millisecond
+	t.Cleanup(func() { readerGoneDrain = old })
+	r := newRelayRig(t, nil)
+	done := r.start()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		chunk := make([]byte, 4<<10)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := r.dest.Write(chunk); err != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	officialClientClose(t, r.client)
+	waitRelay(t, done, "the drain must end at its bound")
+}
+
+// tlsOnTCP is a TLS client over a TCP connection to a TLS server on the
+// destination side: an outbound wrapped the way the HTTPS outbound wraps
+// its socket.
+func tlsOnTCP(t *testing.T, r *relayRig) (*tls.Conn, *tls.Conn) {
+	t.Helper()
+	serverTLS, clientTLS := relayTestTLS(t)
+	client := tls.Client(r.remote, clientTLS)
+	server := tls.Server(r.dest, serverTLS)
+	errs := make(chan error, 1)
+	go func() { errs <- server.Handshake() }()
+	if err := client.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	return client, server
+}
+
+// Codex round 3 on A4, P2: an abort through a wrapped outbound (*tls.Conn)
+// used to skip the linger and close gracefully (close_notify, then FIN).
+// The socket under it must be reset.
+func TestRelayTCPAbortResetsTheSocketUnderATLSOutbound(t *testing.T) {
+	r := newRelayRig(t, nil)
+	remote, dest := tlsOnTCP(t, r)
+	done := r.startWith(remote)
+	_ = dest.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, len("request"))
+	if _, err := io.ReadFull(dest, buf); err != nil {
+		t.Fatal(err)
+	}
+	r.client.CancelWrite(7)
+	r.client.CancelRead(7)
+	waitRelay(t, done, "the relay must end on the client's reset")
+	_, err := dest.Read(buf)
+	if err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("the TLS destination must see its connection reset, not a clean end: got %v", err)
+	}
+	if !isConnReset(err) {
+		t.Fatalf("the TLS destination must see a reset, got %v", err)
+	}
+}
+
+// lingerTarget walks NetConn wrappers down to the socket (cachedConn is in
+// extras, so a stand-in wrapper here).
+type netConnWrapper struct{ net.Conn }
+
+func (w netConnWrapper) NetConn() net.Conn { return w.Conn }
+
+func TestLingerTargetFindsTheSocketUnderWrappers(t *testing.T) {
+	r := newRelayRig(t, nil)
+	tcp := r.remote.(*net.TCPConn)
+	if lingerTarget(netConnWrapper{netConnWrapper{tcp}}) != lingerSetter(tcp) {
+		t.Fatal("lingerTarget must find the TCP socket under nested NetConn wrappers")
+	}
+	if lingerTarget(noHalfClose{tcp}) != nil {
+		t.Fatal("a wrapper without NetConn has no linger target")
+	}
+}
+
+// closeSendSide on a send side the client has already stopped reports the
+// client's StreamError, not quic-go's untyped Close error, so a code-0 stop
+// is still told apart from an abort when the copy's result reaches the relay
+// before the context's cancellation does (Codex round 3 on A4, P1).
+func TestCloseSendSideReportsTheClientsStop(t *testing.T) {
+	for _, code := range []quic.StreamErrorCode{0, 7} {
+		r := newRelayRig(t, nil)
+		r.client.CancelRead(code)
+		select {
+		case <-r.server.Context().Done():
+		case <-time.After(3 * time.Second):
+			t.Fatal("the client's STOP_SENDING never reached the server")
+		}
+		err := closeSendSide(r.server)
+		var se *quic.StreamError
+		if !errors.As(err, &se) || se.ErrorCode != code || !se.Remote {
+			t.Fatalf("code %d: closeSendSide returned %v; want the client's StreamError", code, err)
+		}
+		if clientStoppedReading(err) != (code == 0) {
+			t.Fatalf("code %d: clientStoppedReading(%v) = %v", code, err, clientStoppedReading(err))
+		}
 	}
 }

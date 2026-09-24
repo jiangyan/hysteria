@@ -192,3 +192,9 @@ func (c *cachedConn) Read(b []byte) (int, error) {
 	}
 	return c.Conn.Read(b)
 }
+
+// NetConn returns the wrapped connection (daisy fork): the server's TCP
+// relay finds the socket to abort through it (core/server/relay_tcp.go).
+func (c *cachedConn) NetConn() net.Conn {
+	return c.Conn
+}

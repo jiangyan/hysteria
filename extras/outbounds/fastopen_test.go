@@ -148,3 +148,26 @@ func TestFastOpenConnSetLingerBeforeAnyWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Codex round 3 on A4: a SetLinger(0) before the first Write is kept and
+// applied to the connection that Write dials, so an abort that races the
+// first dial still closes with a reset, not a FIN.
+func TestFastOpenConnSetLingerBeforeTheDialIsKept(t *testing.T) {
+	c, accepted := fastOpenPair(t)
+	if err := c.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write([]byte("part of an upload")); err != nil {
+		t.Fatal(err)
+	}
+	peer := acceptPeer(t, accepted)
+	buf := make([]byte, len("part of an upload"))
+	if _, err := io.ReadFull(peer, buf); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+	_, err := peer.Read(buf)
+	if !isConnReset(err) {
+		t.Fatalf("destination read error %v; want a connection reset", err)
+	}
+}

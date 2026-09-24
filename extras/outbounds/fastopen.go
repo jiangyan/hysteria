@@ -45,6 +45,7 @@ type fastOpenConn struct {
 	deadline      *time.Time
 	readDeadline  *time.Time
 	writeDeadline *time.Time
+	linger        *int
 }
 
 func (c *fastOpenConn) Read(b []byte) (n int, err error) {
@@ -113,6 +114,11 @@ func (c *fastOpenConn) Write(b []byte) (n int, err error) {
 	}
 	if c.writeDeadline != nil {
 		_ = conn.SetWriteDeadline(*c.writeDeadline)
+	}
+	if c.linger != nil {
+		if l, ok := conn.(interface{ SetLinger(sec int) error }); ok {
+			_ = l.SetLinger(*c.linger)
+		}
 	}
 
 	c.conn = conn
@@ -260,15 +266,19 @@ func (c *fastOpenConn) CloseWrite() error {
 }
 
 // SetLinger sets SO_LINGER on the connection (0: Close sends an RST).
-// Before the first Write nothing was dialed and there is nothing to reset.
+// Before the first Write nothing was dialed: the setting is kept and applied
+// to the connection a later Write dials, like the deadlines are (Codex
+// round 3 on A4: an abort's SetLinger(0) racing the first Write was lost,
+// and the new connection closed with a FIN).
 func (c *fastOpenConn) SetLinger(sec int) error {
-	c.connLock.RLock()
+	c.connLock.Lock()
 	conn := c.conn
-	c.connLock.RUnlock()
-
 	if conn == nil {
+		c.linger = &sec
+		c.connLock.Unlock()
 		return nil
 	}
+	c.connLock.Unlock()
 
 	if l, ok := conn.(interface{ SetLinger(sec int) error }); ok {
 		return l.SetLinger(sec)
