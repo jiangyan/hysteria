@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -271,22 +272,31 @@ type noHalfClose struct{ net.Conn }
 func TestRelayTCPFallbackReturnsWhileTheDownloadIsBlocked(t *testing.T) {
 	old := fallbackWriteGrace
 	fallbackWriteGrace = 300 * time.Millisecond
-	t.Cleanup(func() { fallbackWriteGrace = old })
+	reset := make(chan struct{})
+	fallbackGraceReset = func() { close(reset) }
+	t.Cleanup(func() { fallbackWriteGrace, fallbackGraceReset = old, nil })
 	// A client that never reads: its stream window stays small, and full.
 	r := newRelayRig(t, &quic.Config{InitialStreamReceiveWindow: 16 << 10, MaxStreamReceiveWindow: 16 << 10})
 	done := r.startWith(noHalfClose{r.remote})
-	go func() { _, _ = r.dest.Write(make([]byte, 4<<20)) }()
-	// Let the download fill the window and block in stream.Write.
-	time.Sleep(300 * time.Millisecond)
+	written := streamInto(t, r.dest)
+	// The download fills the client's window and blocks in stream.Write:
+	// proven when the destination's own writes stall (nobody reads the
+	// server's socket any more), not assumed after a sleep.
+	waitStalled(t, written)
 	// The client finishes its upload: the first direction ends cleanly.
 	if err := r.client.Close(); err != nil {
 		t.Fatal(err)
 	}
 	waitRelay(t, done, "the fallback is waiting on a download blocked by flow control")
 	// The blocked copy is not left for ever (Codex round 3 on A4): after the
-	// grace its stream side is reset, so a client that finally reads gets
-	// the reset, not an EOF that makes the cut download look complete.
-	time.Sleep(600 * time.Millisecond)
+	// grace its stream side is reset. Wait for that reset itself (reading
+	// first would release the copy and prove nothing), then read: the client
+	// gets the reset, not an EOF that makes the cut download look complete.
+	select {
+	case <-reset:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the grace never reset the blocked copy's stream")
+	}
 	_ = r.client.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, err := io.ReadAll(r.client)
 	var se *quic.StreamError
@@ -437,7 +447,11 @@ func TestRelayTCPStopThenDestinationEOFKeepsTheUpload(t *testing.T) {
 	r := newRelayRig(t, nil)
 	done := r.start()
 	r.client.CancelRead(0) // the official client's STOP_SENDING, before its FIN
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-r.server.Context().Done(): // it reached the server
+	case <-time.After(3 * time.Second):
+		t.Fatal("the client's STOP_SENDING never reached the server")
+	}
 	if err := r.dest.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
@@ -553,24 +567,35 @@ func TestRelayTCPAbortResetsTheSocketUnderATLSOutbound(t *testing.T) {
 	r := newRelayRig(t, nil)
 	remote, dest := tlsOnTCP(t, r)
 	done := r.startWith(remote)
-	_ = dest.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buf := make([]byte, len("request"))
-	if _, err := io.ReadFull(dest, buf); err != nil {
-		t.Fatal(err)
-	}
+	// The destination reads CONCURRENTLY, as a proxy does: whatever reaches
+	// it first decides what it sees (Codex round 4 on A4 — a reader that
+	// only reads after the relay ends cannot tell a close_notify that
+	// arrived first from the RST).
+	ends := make(chan error, 1)
+	go func() {
+		_ = dest.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 64)
+		for {
+			if _, err := dest.Read(buf); err != nil {
+				ends <- err
+				return
+			}
+		}
+	}()
+	time.Sleep(50 * time.Millisecond) // the request is read; the reader parks
 	r.client.CancelWrite(7)
 	r.client.CancelRead(7)
 	waitRelay(t, done, "the relay must end on the client's reset")
-	_, err := dest.Read(buf)
-	if err == nil || errors.Is(err, io.EOF) {
-		t.Fatalf("the TLS destination must see its connection reset, not a clean end: got %v", err)
+	err := <-ends
+	if errors.Is(err, io.EOF) {
+		t.Fatalf("the TLS destination took the abort as a clean end (close_notify before the RST): %v", err)
 	}
 	if !isConnReset(err) {
 		t.Fatalf("the TLS destination must see a reset, got %v", err)
 	}
 }
 
-// lingerTarget walks NetConn wrappers down to the socket (cachedConn is in
+// socketUnder walks NetConn wrappers down to the socket (cachedConn is in
 // extras, so a stand-in wrapper here).
 type netConnWrapper struct{ net.Conn }
 
@@ -579,10 +604,10 @@ func (w netConnWrapper) NetConn() net.Conn { return w.Conn }
 func TestLingerTargetFindsTheSocketUnderWrappers(t *testing.T) {
 	r := newRelayRig(t, nil)
 	tcp := r.remote.(*net.TCPConn)
-	if lingerTarget(netConnWrapper{netConnWrapper{tcp}}) != lingerSetter(tcp) {
-		t.Fatal("lingerTarget must find the TCP socket under nested NetConn wrappers")
+	if socketUnder(netConnWrapper{netConnWrapper{tcp}}) != net.Conn(tcp) {
+		t.Fatal("socketUnder must find the TCP socket under nested NetConn wrappers")
 	}
-	if lingerTarget(noHalfClose{tcp}) != nil {
+	if socketUnder(noHalfClose{tcp}) != nil {
 		t.Fatal("a wrapper without NetConn has no linger target")
 	}
 }
@@ -609,4 +634,96 @@ func TestCloseSendSideReportsTheClientsStop(t *testing.T) {
 			t.Fatalf("code %d: clientStoppedReading(%v) = %v", code, err, clientStoppedReading(err))
 		}
 	}
+}
+
+// streamInto writes to dest in 16 KiB chunks until a write fails (the rig
+// closes dest at cleanup), counting the bytes written. Unbounded on purpose:
+// a writer that stopped by itself would look like a stalled one.
+func streamInto(t *testing.T, dest *net.TCPConn) *atomic.Int64 {
+	t.Helper()
+	var written atomic.Int64
+	go func() {
+		chunk := make([]byte, 16<<10)
+		for {
+			n, err := dest.Write(chunk)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return &written
+}
+
+// waitStalled waits until the byte count stops moving for 300 ms: the
+// destination's writes are blocked because nobody reads the other end.
+func waitStalled(t *testing.T, written *atomic.Int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	last := written.Load()
+	for time.Now().Before(deadline) {
+		time.Sleep(300 * time.Millisecond)
+		now := written.Load()
+		if now == last && now > 0 {
+			return
+		}
+		last = now
+	}
+	t.Fatalf("the destination's writes never stalled (%d bytes written)", written.Load())
+}
+
+// Codex round 4 on A4: after a code-0 stop the drain went through a plain
+// io.Copy, which neither counted the bytes nor asked the traffic logger, and
+// the relay then accepted any end of the download, so a disconnect the
+// logger requested was swallowed. The drain now goes through the relay's
+// own copy function, and errDisconnect always ends the relay with that
+// error (the handler then closes the client's connection).
+func TestRelayTCPDrainStillHonoursTheTrafficLogger(t *testing.T) {
+	r := newRelayRig(t, nil)
+	plain := func(dst io.Writer, src io.Reader) error {
+		_, err := io.Copy(dst, src)
+		return err
+	}
+	// The logger's verdict comes while the relay drains (dst is io.Discard):
+	// it asks for a disconnect.
+	kickWhileDraining := func(dst io.Writer, src io.Reader) error {
+		if dst == io.Discard {
+			return copyBufferLog(dst, src, func(uint64) bool { return false })
+		}
+		_, err := io.Copy(dst, src)
+		return err
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := relayTCP(r.server, r.remote, plain, kickWhileDraining)
+		_ = r.remote.Close()
+		_ = r.server.Close()
+		done <- err
+	}()
+	streamInto(t, r.dest)
+	officialClientClose(t, r.client)
+	if err := waitRelay(t, done, "the relay must end on the logger's disconnect"); !errors.Is(err, errDisconnect) {
+		t.Fatalf("the relay must end with errDisconnect so the handler disconnects the client, got %v", err)
+	}
+}
+
+// Codex round 4 on A4: the drain's deadline was armed only once the upload
+// was done, so a client that stopped reading (code 0) but kept its upload
+// open let the destination stream into the drain for as long as it liked.
+// The deadline now runs from the client's stop: after it, nothing reads the
+// destination any more and its writes stall.
+func TestRelayTCPDrainIsBoundedFromTheClientsStop(t *testing.T) {
+	old := readerGoneDrain
+	readerGoneDrain = 300 * time.Millisecond
+	t.Cleanup(func() { readerGoneDrain = old })
+	r := newRelayRig(t, nil)
+	done := r.start()
+	written := streamInto(t, r.dest)
+	r.client.CancelRead(0) // stops reading; its upload stays open
+	waitStalled(t, written)
+	// The relay still waits for the upload, which ends now.
+	if err := r.client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitRelay(t, done, "the relay must end once the upload ends")
 }
