@@ -1,6 +1,7 @@
 package outbounds
 
 import (
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -226,4 +227,57 @@ func (c *fastOpenConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-var _ net.Conn = (*fastOpenConn)(nil)
+// daisy fork: the server's TCP relay (core/server/relay_tcp.go) passes a
+// clean end on with CloseWrite and aborts a failed transfer with
+// SetLinger(0), and falls back to closing gracefully when the remote
+// connection has neither. Without the two methods below, a server with
+// fastOpen enabled lost both: a half-closed client lost its reply and an
+// aborted transfer reached the destination as a FIN. The dialed connection
+// is a *net.TCPConn on every tfo-go path, so both delegate.
+
+// CloseWrite half-closes the connection. Nothing is dialed before the
+// first Write, so a client that ends its upload without sending a byte is
+// dialed here (an empty first write is a plain connect): the destination
+// sees what a server without fastOpen shows it — a connection, then a FIN.
+func (c *fastOpenConn) CloseWrite() error {
+	c.connLock.RLock()
+	conn := c.conn
+	c.connLock.RUnlock()
+
+	if conn == nil {
+		if _, err := c.Write(nil); err != nil {
+			return err
+		}
+		c.connLock.RLock()
+		conn = c.conn
+		c.connLock.RUnlock()
+	}
+
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errors.ErrUnsupported
+}
+
+// SetLinger sets SO_LINGER on the connection (0: Close sends an RST).
+// Before the first Write nothing was dialed and there is nothing to reset.
+func (c *fastOpenConn) SetLinger(sec int) error {
+	c.connLock.RLock()
+	conn := c.conn
+	c.connLock.RUnlock()
+
+	if conn == nil {
+		return nil
+	}
+
+	if l, ok := conn.(interface{ SetLinger(sec int) error }); ok {
+		return l.SetLinger(sec)
+	}
+	return errors.ErrUnsupported
+}
+
+var (
+	_ net.Conn                          = (*fastOpenConn)(nil)
+	_ interface{ CloseWrite() error }   = (*fastOpenConn)(nil)
+	_ interface{ SetLinger(int) error } = (*fastOpenConn)(nil)
+)
