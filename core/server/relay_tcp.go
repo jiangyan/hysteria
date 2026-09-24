@@ -20,11 +20,17 @@ package server
 //     remote connection's CloseWrite; the stream's send side) and the other
 //     direction carries on;
 //   - a direction that FAILS aborts both sides: the remote connection is
-//     closed with an RST (SetLinger(0)) and the stream is reset both ways.
+//     closed with an RST (SetLinger(0)) and the stream is reset both ways;
+//   - while one direction has ended cleanly and the other is still running,
+//     a client that gives up is noticed even if the remaining copy is parked
+//     in remote.Read on a silent destination: the client's STOP_SENDING
+//     cancels the stream's context (below).
 // A remote connection that cannot half-close (no CloseWrite) keeps upstream's
-// behaviour for a clean end: the first direction to end ends the relay.
+// behaviour for a clean end: the first direction to end ends the relay, and
+// the other copy is not waited for.
 
 import (
+	"context"
 	"io"
 	"net"
 	"time"
@@ -110,14 +116,45 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 	}
 	if !halfClose {
 		// Upstream's behaviour: the first clean end ends the relay; the
-		// caller closes both sides gracefully. Closing the remote here ends
-		// the other direction's copy (its error is expected and ignored).
+		// caller closes both sides gracefully. Closing the remote ends the
+		// other copy if it is reading; one blocked in stream.Write by flow
+		// control is released only when the caller closes the stream, so it
+		// is not waited for here (Codex round 1 on A4) — upstream's
+		// copyTwoWay never waited for it either. `results` is buffered, so
+		// its late send does not block.
 		_ = remote.Close()
 		stream.CancelRead(streamAbortCode)
-		<-results
 		return nil
 	}
-	if second := <-results; second != nil {
+	// One direction ended cleanly; the other is still running. It may be
+	// parked in remote.Read on a silent destination, where nothing tells it
+	// the client has since given up: a client reset after its FIN arrives as
+	// STOP_SENDING on the stream's write side, which only a write would
+	// notice (Codex round 1 on A4). quic-go cancels the write side's context
+	// on it, with the peer's StreamError as the cause.
+	ctx := stream.Context()
+	select {
+	case second := <-results:
+		return finishSecond(stream, remote, second)
+	case <-ctx.Done():
+	}
+	if cause := context.Cause(ctx); cause != context.Canceled {
+		// Stopped by the peer, or the connection is gone: the transfer will
+		// not complete.
+		abortTCP(stream, remote)
+		<-results
+		return cause
+	}
+	// Canceled without a cause is our own Close: the remote → client copy
+	// finished its write side cleanly, and its result is on its way. The
+	// client → remote copy still running reads the stream, so a client
+	// reset reaches it as a read error.
+	return finishSecond(stream, remote, <-results)
+}
+
+// finishSecond ends the relay on the second direction's result.
+func finishSecond(stream *utils.QStream, remote net.Conn, second error) error {
+	if second != nil {
 		abortTCP(stream, remote)
 		return second
 	}
