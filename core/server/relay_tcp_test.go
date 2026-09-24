@@ -589,7 +589,16 @@ func TestRelayTCPAbortResetsTheSocketUnderATLSOutbound(t *testing.T) {
 			}
 		}
 	}()
-	<-readRequest // the reader is past the request, on its next Read
+	// The reader is past the request, on its next Read, or it failed to read
+	// the request at all, which is a failure reported now, not a hang
+	// (Codex round 6 on A4).
+	select {
+	case <-readRequest:
+	case err := <-ends:
+		t.Fatalf("the TLS destination could not read the request: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the TLS destination never read the request")
+	}
 	r.client.CancelWrite(7)
 	r.client.CancelRead(7)
 	waitRelay(t, done, "the relay must end on the client's reset")
