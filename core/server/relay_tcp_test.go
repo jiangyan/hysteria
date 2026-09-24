@@ -142,8 +142,9 @@ func isConnReset(err error) bool {
 	return runtime.GOOS == "windows" && errors.As(err, &errno) && errno == 10054 // WSAECONNRESET
 }
 
-// destinationSeesReset reads until the destination's connection reports how
-// it ended after any EOF it already read: an RST must arrive within 3 s.
+// destinationSeesReset reads until the destination's connection ends: it must
+// end in a reset within 3 s. An EOF first fails it: a FIN, then a reset, is
+// the defect itself (the transfer read as complete).
 func destinationSeesReset(t *testing.T, dest *net.TCPConn) {
 	t.Helper()
 	_ = dest.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -152,12 +153,10 @@ func destinationSeesReset(t *testing.T, dest *net.TCPConn) {
 		_, err := dest.Read(buf)
 		switch {
 		case err == nil:
-		case errors.Is(err, io.EOF):
-			time.Sleep(10 * time.Millisecond)
 		case isConnReset(err):
 			return
 		default:
-			t.Fatalf("the destination must see a reset, got %v", err)
+			t.Fatalf("the destination must see a reset (and no EOF first), got %v", err)
 		}
 	}
 }
@@ -272,4 +271,129 @@ func TestRelayTCPFallbackReturnsWhileTheDownloadIsBlocked(t *testing.T) {
 	waitRelay(t, done, "the fallback is waiting on a download blocked by flow control")
 	// Release the blocked writer.
 	r.client.CancelRead(0)
+}
+
+// officialClientClose closes the client's end the way the official hysteria
+// client does on EVERY end of its side, clean or not (QStream.Close):
+// STOP_SENDING with code 0, then FIN.
+func officialClientClose(t *testing.T, s *quic.Stream) {
+	t.Helper()
+	s.CancelRead(0)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The official client's ordinary close is not an abort (the independent
+// review of A4): the destination gets the whole upload and its EOF, and the
+// relay ends without an error (no WARN "TCP error" per flow).
+func TestRelayTCPOfficialClientCloseIsAnOrdinaryClose(t *testing.T) {
+	r := newRelayRig(t, nil)
+	done := r.start()
+	upload := make([]byte, 64<<10)
+	if _, err := r.client.Write(upload); err != nil {
+		t.Fatal(err)
+	}
+	officialClientClose(t, r.client)
+	_ = r.dest.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(r.dest)
+	if err != nil || len(got) != len("request")+len(upload) {
+		t.Fatalf("destination read %d bytes, %v; want %d, then EOF", len(got), err, len("request")+len(upload))
+	}
+	if err := waitRelay(t, done, "the relay must end on the client's close"); err != nil {
+		t.Fatalf("an ordinary close ended the relay with %v", err)
+	}
+}
+
+// The same close while the destination is still sending, so the copy
+// toward the client fails on the STOP_SENDING before the upload has been
+// read to its end: the relay must still let the upload finish.
+func TestRelayTCPOfficialClientCloseDuringADownloadKeepsTheUpload(t *testing.T) {
+	r := newRelayRig(t, nil)
+	done := r.start()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		chunk := make([]byte, 16<<10)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := r.dest.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	upload := make([]byte, 256<<10)
+	if _, err := r.client.Write(upload); err != nil {
+		t.Fatal(err)
+	}
+	officialClientClose(t, r.client)
+	_ = r.dest.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := io.ReadAll(r.dest)
+	if err != nil || len(got) != len("request")+len(upload) {
+		t.Fatalf("destination read %d bytes, %v; want %d, then EOF", len(got), err, len("request")+len(upload))
+	}
+	if err := waitRelay(t, done, "the relay must end on the client's close"); err != nil {
+		t.Fatalf("an ordinary close ended the relay with %v", err)
+	}
+}
+
+// The other half of "a failure aborts both sides": a destination that resets
+// mid-download resets the client's stream, not an EOF.
+func TestRelayTCPDestinationResetResetsTheClient(t *testing.T) {
+	r := newRelayRig(t, nil)
+	done := r.start()
+	if _, err := r.dest.Write([]byte("part of a download")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len("part of a download"))
+	_ = r.client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(r.client, buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.dest.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	_ = r.dest.Close()
+	_, err := io.ReadAll(r.client)
+	var se *quic.StreamError
+	if !errors.As(err, &se) {
+		t.Fatalf("the client must see its stream reset, got %v", err)
+	}
+	waitRelay(t, done, "the relay must end on the destination's reset")
+}
+
+// The destination closes first: its reply and FIN reach the client, and the
+// client's upload after that still reaches the destination, with its EOF.
+func TestRelayTCPDestinationFirstHalfCloseCarriesTheUpload(t *testing.T) {
+	r := newRelayRig(t, nil)
+	done := r.start()
+	if _, err := r.dest.Write([]byte("reply")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.dest.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = r.client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	reply, err := io.ReadAll(r.client)
+	if err != nil || string(reply) != "reply" {
+		t.Fatalf("client read %q, %v; want the reply, then EOF", reply, err)
+	}
+	if _, err := r.client.Write([]byte(" and more")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = r.dest.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(r.dest)
+	if err != nil || string(got) != "request and more" {
+		t.Fatalf("destination read %q, %v; want the whole upload, then EOF", got, err)
+	}
+	if err := waitRelay(t, done, "the relay must end after both directions ended"); err != nil {
+		t.Fatalf("a clean relay returned %v", err)
+	}
 }
