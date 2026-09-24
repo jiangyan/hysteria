@@ -93,6 +93,16 @@ var fallbackWriteGrace = 30 * time.Second
 // grace reset a copy still blocked on the client's flow control.
 var fallbackGraceReset func()
 
+// drainOverrun is how long past readerGoneDrain a drain may still be running
+// before the relay aborts it. A read deadline does not reach every blocked
+// read: a *tls.Conn's Read that is writing a KeyUpdate response to a
+// destination no longer accepting writes blocks on that write (Codex round 5
+// on A4). A variable so tests can shorten it.
+var drainOverrun = 2 * time.Second
+
+// errDrainOverrun ends a relay whose drain outlived its deadline.
+var errDrainOverrun = errors.New("the destination's drain did not end at its deadline")
+
 type closeWriter interface {
 	CloseWrite() error
 }
@@ -232,10 +242,17 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 	fail := func(err error) error {
 		abortTCP(stream, remote)
 		for ; pending > 0; pending-- {
-			<-results
+			// A disconnect the traffic logger asked for outranks the failure
+			// that ended the relay: the handler must still close the client's
+			// connection, and the logger does not ask twice (Codex round 5 on
+			// A4).
+			if r := <-results; errors.Is(r.err, errDisconnect) {
+				err = r.err
+			}
 		}
 		return err
 	}
+	var overrun <-chan time.Time // armed with the drain's deadline
 	for !(upDone && downDone) {
 		select {
 		case r := <-results:
@@ -257,6 +274,12 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 			default:
 				return fail(r.err)
 			}
+		case <-overrun:
+			// The drain did not end at its read deadline: its copy is stuck
+			// where a read deadline does not reach (see drainOverrun), and
+			// nothing more can complete. Abort, which closes the socket under
+			// it and releases the stuck write.
+			return fail(errDrainOverrun)
 		case <-ctxDone:
 			ctxDone = nil
 			switch cause := context.Cause(ctx); {
@@ -278,7 +301,15 @@ func relayTCP(stream *utils.QStream, remote net.Conn, toRemote, toClient copyFun
 			// copy parked on a silent destination ends at the deadline. The
 			// loop then still waits for the upload.
 			_ = remote.SetReadDeadline(time.Now().Add(readerGoneDrain))
+			t := time.NewTimer(readerGoneDrain + drainOverrun)
+			defer t.Stop()
+			overrun = t.C
 			draining = true
+		}
+		if downDone {
+			// The drain (if any) has ended; the upload that may still be
+			// running is not bounded by it.
+			overrun = nil
 		}
 	}
 	return nil

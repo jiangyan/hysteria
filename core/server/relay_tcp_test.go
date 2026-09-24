@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -572,9 +573,15 @@ func TestRelayTCPAbortResetsTheSocketUnderATLSOutbound(t *testing.T) {
 	// only reads after the relay ends cannot tell a close_notify that
 	// arrived first from the RST).
 	ends := make(chan error, 1)
+	readRequest := make(chan struct{})
 	go func() {
 		_ = dest.SetReadDeadline(time.Now().Add(5 * time.Second))
 		buf := make([]byte, 64)
+		if _, err := io.ReadFull(dest, buf[:len("request")]); err != nil {
+			ends <- err
+			return
+		}
+		close(readRequest)
 		for {
 			if _, err := dest.Read(buf); err != nil {
 				ends <- err
@@ -582,7 +589,7 @@ func TestRelayTCPAbortResetsTheSocketUnderATLSOutbound(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(50 * time.Millisecond) // the request is read; the reader parks
+	<-readRequest // the reader is past the request, on its next Read
 	r.client.CancelWrite(7)
 	r.client.CancelRead(7)
 	waitRelay(t, done, "the relay must end on the client's reset")
@@ -726,4 +733,126 @@ func TestRelayTCPDrainIsBoundedFromTheClientsStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitRelay(t, done, "the relay must end once the upload ends")
+}
+
+// closeRecorder records which connection abortTCP closes, in order.
+type closeRecorder struct{ order []string }
+
+// recordedSocket stands for the TCP socket under a wrapper: it can set its
+// linger, and its Close is recorded.
+type recordedSocket struct {
+	net.Conn
+	rec *closeRecorder
+}
+
+func (s recordedSocket) SetLinger(int) error { return nil }
+func (s recordedSocket) Close() error {
+	s.rec.order = append(s.rec.order, "socket")
+	return nil
+}
+
+// recordedWrapper stands for a *tls.Conn: its NetConn is the socket, and its
+// own Close is recorded (a real one would write close_notify here).
+type recordedWrapper struct {
+	net.Conn
+	inner net.Conn
+	rec   *closeRecorder
+}
+
+func (w recordedWrapper) NetConn() net.Conn { return w.inner }
+func (w recordedWrapper) Close() error {
+	w.rec.order = append(w.rec.order, "wrapper")
+	return nil
+}
+
+// Codex round 5 on A4, P3: the order abortTCP closes in, asserted directly
+// (the TLS row can only observe it through timing): the socket under a
+// wrapper first, so the wrapper's graceful close finds it already reset.
+func TestAbortTCPClosesTheSocketBeforeTheWrapper(t *testing.T) {
+	r := newRelayRig(t, nil)
+	rec := &closeRecorder{}
+	sock := recordedSocket{Conn: r.remote, rec: rec}
+	abortTCP(r.server, recordedWrapper{Conn: r.remote, inner: sock, rec: rec})
+	if len(rec.order) != 2 || rec.order[0] != "socket" || rec.order[1] != "wrapper" {
+		t.Fatalf("abortTCP must close the socket, then the wrapper; got %v", rec.order)
+	}
+}
+
+// Codex round 5 on A4, P2: fail() drained the other copy's result without
+// looking at it, so a disconnect the traffic logger asked for in the drain
+// was lost behind a competing upload failure. The order is forced: the
+// upload fails only once the drain has begun, and the drain reports the
+// disconnect only after the abort closes its socket.
+func TestRelayTCPADisconnectOutranksACompetingFailure(t *testing.T) {
+	r := newRelayRig(t, nil)
+	draining := make(chan struct{})
+	errUpload := errors.New("the upload failed")
+	upload := func(dst io.Writer, src io.Reader) error {
+		<-draining
+		return errUpload
+	}
+	download := func(dst io.Writer, src io.Reader) error {
+		if dst != io.Discard {
+			_, err := io.Copy(dst, src)
+			return err
+		}
+		close(draining)
+		buf := make([]byte, 1)
+		for {
+			if _, err := src.Read(buf); err != nil {
+				// The abort closed the socket: the logger's verdict, now.
+				return errDisconnect
+			}
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- relayTCP(r.server, r.remote, upload, download) }()
+	r.client.CancelRead(0) // the client reads no more
+	select {
+	case <-r.server.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the client's STOP_SENDING never reached the server")
+	}
+	// A write toward the client now fails on the stop: the download drains.
+	if _, err := r.dest.Write([]byte("reply")); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitRelay(t, done, "the relay must end"); !errors.Is(err, errDisconnect) {
+		t.Fatalf("the logger's disconnect must outrank the upload's failure, got %v", err)
+	}
+}
+
+// stuckReadConn is a remote whose Read ignores read deadlines and blocks
+// until Close, as a *tls.Conn's Read does while it writes a KeyUpdate
+// response to a destination that no longer accepts writes.
+type stuckReadConn struct {
+	*net.TCPConn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *stuckReadConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+func (c *stuckReadConn) SetReadDeadline(time.Time) error { return nil }
+func (c *stuckReadConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.TCPConn.Close()
+}
+
+// Codex round 5 on A4, P2: a drain stuck where its read deadline does not
+// reach held the relay (and the destination) past the bound. The relay now
+// aborts it at readerGoneDrain + drainOverrun.
+func TestRelayTCPAStuckDrainIsAbortedAtItsBound(t *testing.T) {
+	oldDrain, oldOverrun := readerGoneDrain, drainOverrun
+	readerGoneDrain, drainOverrun = 100*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { readerGoneDrain, drainOverrun = oldDrain, oldOverrun })
+	r := newRelayRig(t, nil)
+	stuck := &stuckReadConn{TCPConn: r.remote.(*net.TCPConn), closed: make(chan struct{})}
+	done := r.startWith(stuck)
+	r.client.CancelRead(0) // the client reads no more; its upload stays open
+	if err := waitRelay(t, done, "a stuck drain must be aborted at its bound"); !errors.Is(err, errDrainOverrun) {
+		t.Fatalf("the relay must end with errDrainOverrun, got %v", err)
+	}
 }
