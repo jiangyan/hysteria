@@ -328,12 +328,13 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		n, _ := tConn.Write(putback)
 		streamStats.Tx.Add(uint64(n))
 	}
-	// Start proxying
+	// Start proxying. daisy fork: relayTCP keeps TCP half-close and turns a
+	// failed transfer into an abort on the other side (relay_tcp.go).
 	if trafficLogger != nil {
-		err = copyTwoWayEx(h.authID, stream, tConn, trafficLogger, streamStats)
+		err = relayTCPEx(h.authID, stream, tConn, trafficLogger, streamStats)
 	} else {
 		// Use the fast path if no traffic logger is set
-		err = copyTwoWay(stream, tConn)
+		err = relayTCPFast(stream, tConn)
 	}
 	if h.config.EventLogger != nil {
 		h.config.EventLogger.TCPError(h.conn.RemoteAddr(), h.authID, reqAddr, err)
